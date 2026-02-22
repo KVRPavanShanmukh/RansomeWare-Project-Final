@@ -114,6 +114,34 @@ def start_monitor(path):
 
     observer.join()
 
+import requests
+
+def send_log_file():
+    log_path = os.path.join("logs", "monitor.log")
+
+    if not os.path.exists(log_path):
+        return
+
+    try:
+        with open(log_path, "rb") as f:
+            files = {"file": ("monitor.log", f)}
+            data = {"token": TOKEN}
+
+            requests.post(
+                f"{API_BASE}/api/detector/log",
+                json={
+                    "token": TOKEN,
+                    "event_type": "mass_rename",
+                    "details": {
+                        "directory": monitored_path,
+                        "count": len(rename_events)
+                    },
+                    "timestamp": datetime.now().isoformat()
+                }
+            )
+    except Exception as e:
+        print("Log upload failed:", e)
+
 if __name__ == "__main__":
     user_input = input("Enter directory to monitor: ").strip()
 

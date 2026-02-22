@@ -13,6 +13,9 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
+
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -20,6 +23,14 @@ from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from mysql.connector import pooling
 from werkzeug.security import generate_password_hash, check_password_hash
+
+# PDF + Graph
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import inch
+import matplotlib.pyplot as plt
 
 
 # =====================================================
@@ -35,7 +46,7 @@ print("Starting PRD-SYS Backend...")
 
 
 # =====================================================
-# DATABASE CONFIGURATION
+# DATABASE CONFIG
 # =====================================================
 
 dbconf = {
@@ -56,7 +67,7 @@ print("MySQL pool ready.")
 
 
 # =====================================================
-# GLOBAL CONSTANTS
+# GLOBALS
 # =====================================================
 
 DETECTOR_PACKAGE_DIR = Path(__file__).resolve().parent / "detector_package"
@@ -127,17 +138,12 @@ def send_email_safe(to_email, subject, body):
 def signup():
     data = request.json
 
-    if not all([
-        data.get("username"),
-        data.get("email"),
-        data.get("password"),
-        data.get("sec_q"),
-        data.get("sec_a")
-    ]):
+    if not all([data.get("username"), data.get("email"),
+                data.get("password"), data.get("sec_q"), data.get("sec_a")]):
         return jsonify({"error": "All fields required"}), 400
 
     conn = pool.get_connection()
-    cursor = conn.cursor(dictionary=True)
+    cursor = conn.cursor(dictionary=True, buffered=True)
 
     cursor.execute("SELECT id FROM users WHERE username=%s", (data["username"],))
     if cursor.fetchone():
@@ -162,12 +168,11 @@ def signup():
 
 
 @app.route('/api/login', methods=['POST'])
-@app.route('/api/login', methods=['POST'])
 def login():
     data = request.json
 
     conn = pool.get_connection()
-    cursor = conn.cursor(dictionary=True)
+    cursor = conn.cursor(dictionary=True, buffered=True)
 
     cursor.execute(
         "SELECT * FROM users WHERE username=%s OR email=%s",
@@ -175,10 +180,6 @@ def login():
     )
 
     user = cursor.fetchone()
-
-    # 🔥 IMPORTANT FIX
-    cursor.fetchall()  # Clear unread results
-
     cursor.close()
     conn.close()
 
@@ -205,6 +206,7 @@ def login():
     )
 
     return jsonify({"pending": True, "identifier": email}), 200
+
 
 @app.route('/api/login/verify', methods=['POST'])
 def verify():
@@ -282,13 +284,10 @@ def detector_download():
 @app.route('/api/detector/log', methods=['POST'])
 def detector_log():
     data = request.get_json()
-
     info = verify_detector_token(data.get("token"))
+
     if not info:
         return jsonify({"error": "Invalid token"}), 401
-
-    user_id = info["user_id"]
-    user_email = info["email"]
 
     conn = pool.get_connection()
     cursor = conn.cursor()
@@ -297,7 +296,7 @@ def detector_log():
         INSERT INTO detector_logs (user_id, event_type, directory, event_count)
         VALUES (%s, %s, %s, %s)
     """, (
-        user_id,
+        info["user_id"],
         data.get("event_type"),
         data.get("details", {}).get("directory"),
         data.get("details", {}).get("count")
@@ -307,64 +306,166 @@ def detector_log():
     cursor.close()
     conn.close()
 
-    if data.get("event_type") == "mass_rename":
-        send_email_safe(
-            user_email,
-            "⚠ PRD-SYS ALERT: Mass File Rename Detected",
-            f"""
-Mass rename detected.
-
-Directory: {data.get("details", {}).get("directory")}
-Count: {data.get("details", {}).get("count")}
-
-Check your system immediately.
-"""
-        )
-
     return jsonify({"status": "event stored"}), 200
 
 
 # =====================================================
-# DAILY SUMMARY SCHEDULER
+# LOG FILE UPLOAD
 # =====================================================
+
+@app.route('/api/detector/upload-log', methods=['POST'])
+def upload_log():
+    token = request.form.get("token")
+    file = request.files.get("file")
+
+    info = verify_detector_token(token)
+    if not info or not file:
+        return jsonify({"error": "Invalid request"}), 400
+
+    msg = MIMEMultipart()
+    msg["From"] = os.getenv("MAIL_USER")
+    msg["To"] = info["email"]
+    msg["Subject"] = "📁 PRD-SYS Log File Report"
+
+    msg.attach(MIMEText("Attached is your detector log file.", "plain"))
+
+    part = MIMEBase("application", "octet-stream")
+    part.set_payload(file.read())
+    encoders.encode_base64(part)
+    part.add_header("Content-Disposition", "attachment; filename=monitor.log")
+    msg.attach(part)
+
+    server = smtplib.SMTP(os.getenv("MAIL_HOST"), int(os.getenv("MAIL_PORT", 587)))
+    server.starttls()
+    server.login(os.getenv("MAIL_USER"), os.getenv("MAIL_PASS"))
+    server.sendmail(os.getenv("MAIL_USER"), info["email"], msg.as_string())
+    server.quit()
+
+    return jsonify({"status": "Log file sent"}), 200
+
+
+# =====================================================
+# PDF REPORT GENERATION
+# =====================================================
+
+def generate_pdf_report(user_id, user_email):
+    conn = pool.get_connection()
+    cursor = conn.cursor(dictionary=True)
+
+    cursor.execute("""
+        SELECT event_type, COUNT(*) as count
+        FROM detector_logs
+        WHERE user_id = %s
+        AND DATE(created_at) = CURDATE() - INTERVAL 1 DAY
+        GROUP BY event_type
+    """, (user_id,))
+
+    rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
+
+    if not rows:
+        return None
+
+    event_types = [r["event_type"] for r in rows]
+    counts = [r["count"] for r in rows]
+
+    plt.figure()
+    plt.bar(event_types, counts)
+    plt.title("Event Distribution")
+    plt.xlabel("Event Type")
+    plt.ylabel("Count")
+
+    chart_path = f"chart_{user_id}.png"
+    plt.savefig(chart_path)
+    plt.close()
+
+    pdf_path = f"Security_Report_{user_id}.pdf"
+    doc = SimpleDocTemplate(pdf_path, pagesize=A4)
+    elements = []
+    styles = getSampleStyleSheet()
+
+    elements.append(Paragraph("PRD-SYS Daily Security Report", styles["Heading1"]))
+    elements.append(Spacer(1, 12))
+    elements.append(Paragraph(f"User: {user_email}", styles["Normal"]))
+    elements.append(Spacer(1, 12))
+
+    table_data = [["Event Type", "Count"]]
+    for r in rows:
+        table_data.append([r["event_type"], r["count"]])
+
+    table = Table(table_data)
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.grey),
+        ("GRID", (0,0), (-1,-1), 1, colors.black)
+    ]))
+
+    elements.append(table)
+    elements.append(Spacer(1, 20))
+    elements.append(Image(chart_path, width=4*inch, height=3*inch))
+
+    doc.build(elements)
+
+    os.remove(chart_path)
+    return pdf_path
+
+
+def send_pdf_email(to_email, pdf_path):
+    msg = MIMEMultipart()
+    msg["From"] = os.getenv("MAIL_USER")
+    msg["To"] = to_email
+    msg["Subject"] = "📊 PRD-SYS Daily Security Report"
+
+    msg.attach(MIMEText("Attached is your daily security report.", "plain"))
+
+    with open(pdf_path, "rb") as f:
+        part = MIMEBase("application", "octet-stream")
+        part.set_payload(f.read())
+
+    encoders.encode_base64(part)
+    part.add_header("Content-Disposition",
+                    f"attachment; filename={os.path.basename(pdf_path)}")
+
+    msg.attach(part)
+
+    server = smtplib.SMTP(os.getenv("MAIL_HOST"), int(os.getenv("MAIL_PORT", 587)))
+    server.starttls()
+    server.login(os.getenv("MAIL_USER"), os.getenv("MAIL_PASS"))
+    server.sendmail(os.getenv("MAIL_USER"), to_email, msg.as_string())
+    server.quit()
+
 
 def send_daily_summary():
     print("Running daily summary job...")
 
     conn = pool.get_connection()
-    cursor = conn.cursor(dictionary=True, buffered=True)
+    cursor = conn.cursor(dictionary=True)
 
     cursor.execute("""
-        SELECT user_id, COUNT(*) as total_events
+        SELECT DISTINCT user_id
         FROM detector_logs
         WHERE DATE(created_at) = CURDATE() - INTERVAL 1 DAY
-        GROUP BY user_id
     """)
 
     users = cursor.fetchall()
 
     for row in users:
-        cursor.execute("SELECT email FROM users WHERE id = %s", (row["user_id"],))
+        cursor.execute("SELECT email FROM users WHERE id=%s", (row["user_id"],))
         user = cursor.fetchone()
 
         if user:
-            send_email_safe(
-                user["email"],
-                "📊 PRD-SYS Daily Security Summary",
-                f"""
-PRD-SYS Daily Summary Report
-
-Total suspicious events yesterday: {row["total_events"]}
-
-Login to dashboard for detailed insights.
-
-Stay secure.
-"""
-            )
+            pdf_path = generate_pdf_report(row["user_id"], user["email"])
+            if pdf_path:
+                send_pdf_email(user["email"], pdf_path)
+                os.remove(pdf_path)
 
     cursor.close()
     conn.close()
 
+
+# =====================================================
+# SCHEDULER
+# =====================================================
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(send_daily_summary, 'cron', hour=9)
