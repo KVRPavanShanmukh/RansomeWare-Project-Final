@@ -14,21 +14,29 @@ from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from dotenv import load_dotenv
+from apscheduler.schedulers.background import BackgroundScheduler
 
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
-import mysql.connector
 from mysql.connector import pooling
 from werkzeug.security import generate_password_hash, check_password_hash
+
+
+# =====================================================
+# INITIAL SETUP
+# =====================================================
 
 load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
 
-# ==============================
-# DATABASE CONNECTION
-# ==============================
+print("Starting PRD-SYS Backend...")
+
+
+# =====================================================
+# DATABASE CONFIGURATION
+# =====================================================
 
 dbconf = {
     "host": os.getenv("DB_HOST", "localhost"),
@@ -46,22 +54,27 @@ pool = pooling.MySQLConnectionPool(
 
 print("MySQL pool ready.")
 
-# ==============================
-# DETECTOR PACKAGE LOCATION
-# ==============================
+
+# =====================================================
+# GLOBAL CONSTANTS
+# =====================================================
 
 DETECTOR_PACKAGE_DIR = Path(__file__).resolve().parent / "detector_package"
-
-# ==============================
-# TOKEN SYSTEM
-# ==============================
-
 DETECTOR_SECRET = os.getenv("DETECTOR_SECRET", "prd-secret")
+
+_pending_logins = {}
+OTP_EXPIRY = 10
+
+
+# =====================================================
+# UTILITY FUNCTIONS
+# =====================================================
 
 def create_detector_token(user_id, email):
     raw = f"{user_id}|{email}|{secrets.token_hex(8)}"
     sig = hmac.new(DETECTOR_SECRET.encode(), raw.encode(), hashlib.sha256).hexdigest()
     return base64.urlsafe_b64encode(f"{sig}|{raw}".encode()).decode()
+
 
 def verify_detector_token(token):
     try:
@@ -75,9 +88,6 @@ def verify_detector_token(token):
     except:
         return None
 
-# ==============================
-# EMAIL FUNCTION
-# ==============================
 
 def send_email_safe(to_email, subject, body):
     try:
@@ -103,33 +113,33 @@ def send_email_safe(to_email, subject, body):
         server.quit()
 
         return True
+
     except Exception as e:
         print("Email error:", e)
         return False
 
-# ==============================
-# AUTH
-# ==============================
 
-_pending_logins = {}
-OTP_EXPIRY = 10
+# =====================================================
+# AUTH ROUTES
+# =====================================================
 
 @app.route('/api/signup', methods=['POST'])
 def signup():
     data = request.json
-    username = data.get("username")
-    email = data.get("email")
-    password = data.get("password")
-    sec_q = data.get("sec_q")
-    sec_a = data.get("sec_a")
 
-    if not all([username, email, password, sec_q, sec_a]):
+    if not all([
+        data.get("username"),
+        data.get("email"),
+        data.get("password"),
+        data.get("sec_q"),
+        data.get("sec_a")
+    ]):
         return jsonify({"error": "All fields required"}), 400
 
     conn = pool.get_connection()
     cursor = conn.cursor(dictionary=True)
 
-    cursor.execute("SELECT id FROM users WHERE username=%s", (username,))
+    cursor.execute("SELECT id FROM users WHERE username=%s", (data["username"],))
     if cursor.fetchone():
         return jsonify({"error": "Username taken"}), 409
 
@@ -137,11 +147,11 @@ def signup():
         INSERT INTO users (username, password_hash, email, sec_q, sec_a_hash)
         VALUES (%s, %s, %s, %s, %s)
     """, (
-        username,
-        generate_password_hash(password),
-        email,
-        sec_q,
-        generate_password_hash(sec_a)
+        data["username"],
+        generate_password_hash(data["password"]),
+        data["email"],
+        data["sec_q"],
+        generate_password_hash(data["sec_a"])
     ))
 
     conn.commit()
@@ -150,25 +160,24 @@ def signup():
 
     return jsonify({"message": "User created"}), 201
 
+
 @app.route('/api/login', methods=['POST'])
 def login():
     data = request.json
-    identifier = data.get("username")
-    password = data.get("password")
 
     conn = pool.get_connection()
     cursor = conn.cursor(dictionary=True)
 
     cursor.execute(
         "SELECT * FROM users WHERE username=%s OR email=%s",
-        (identifier, identifier)
+        (data.get("username"), data.get("username"))
     )
 
     user = cursor.fetchone()
     cursor.close()
     conn.close()
 
-    if not user or not check_password_hash(user["password_hash"], password):
+    if not user or not check_password_hash(user["password_hash"], data.get("password")):
         return jsonify({"error": "Invalid credentials"}), 401
 
     email = user["email"]
@@ -181,46 +190,42 @@ def login():
         "user_id": user["id"],
         "username": user["username"],
         "email": email,
-        "role": user.get("role", "user"),
         "expires_at": datetime.now(timezone.utc) + timedelta(minutes=OTP_EXPIRY)
     }
 
-    body = f"OTP: {otp}\nPSK: {psk}\nValid for {OTP_EXPIRY} minutes."
-    send_email_safe(email, "PRD-SYS Login", body)
+    send_email_safe(
+        email,
+        "PRD-SYS Login",
+        f"OTP: {otp}\nPSK: {psk}\nValid for {OTP_EXPIRY} minutes."
+    )
 
-    return jsonify({
-        "pending": True,
-        "identifier": email
-    }), 200
+    return jsonify({"pending": True, "identifier": email}), 200
+
 
 @app.route('/api/login/verify', methods=['POST'])
 def verify():
     data = request.json
-    identifier = data.get("identifier")
-    otp = data.get("otp")
-    psk = data.get("psk")
+    identifier = data.get("identifier", "").lower()
+    pending = _pending_logins.get(identifier)
 
-    pending = _pending_logins.get(identifier.lower())
     if not pending:
         return jsonify({"error": "Invalid or expired"}), 401
 
-    if pending["otp"] != otp or pending["psk"] != psk:
+    if pending["otp"] != data.get("otp") or pending["psk"] != data.get("psk"):
         return jsonify({"error": "Invalid OTP/PSK"}), 401
 
     conn = pool.get_connection()
     cursor = conn.cursor()
-
     cursor.execute("""
         INSERT INTO login_sessions (user_id, login_time, is_active)
         VALUES (%s, NOW(), TRUE)
     """, (pending["user_id"],))
-
     conn.commit()
     cursor.close()
     conn.close()
 
     token = create_detector_token(pending["user_id"], pending["email"])
-    del _pending_logins[identifier.lower()]
+    del _pending_logins[identifier]
 
     return jsonify({
         "message": "Login successful",
@@ -230,32 +235,28 @@ def verify():
         "user_id": pending["user_id"]
     }), 200
 
-# ==============================
+
+# =====================================================
 # DETECTOR DOWNLOAD
-# ==============================
+# =====================================================
 
 @app.route('/api/detector-download', methods=['GET'])
 def detector_download():
     token = request.args.get("token")
-    if not token:
-        return jsonify({"error": "token required"}), 400
-
     info = verify_detector_token(token)
+
     if not info:
         return jsonify({"error": "Invalid token"}), 401
 
-    if not DETECTOR_PACKAGE_DIR.exists():
-        return jsonify({"error": "Detector package not found"}), 404
-
-    config = {
-        "api_base": request.url_root.rstrip("/"),
-        "token": token,
-        "email": info["email"]
-    }
-
     buffer = io.BytesIO()
+
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("config.json", json.dumps(config, indent=2))
+        zf.writestr("config.json", json.dumps({
+            "api_base": request.url_root.rstrip("/"),
+            "token": token,
+            "email": info["email"]
+        }, indent=2))
+
         for file in DETECTOR_PACKAGE_DIR.rglob("*"):
             if file.is_file():
                 zf.write(file, file.relative_to(DETECTOR_PACKAGE_DIR))
@@ -269,26 +270,106 @@ def detector_download():
         download_name="PRD-SYS-FolderGuard.zip"
     )
 
-# ==============================
-# SYSMON LIVE FAKE STREAM
-# ==============================
 
-SYSMON_TEMPLATES = [
-    {"id": 11, "type": "FileRename", "process": "unknown.exe", "target": "C:/Docs/test.locked", "alert": "CRITICAL"},
-    {"id": 1, "type": "ProcessCreate", "process": "cmd.exe", "target": "N/A", "alert": "medium"},
-    {"id": 3, "type": "NetworkConn", "process": "powershell.exe", "target": "185.22.1.1:443", "alert": "high"},
-]
+# =====================================================
+# DETECTOR LOG RECEIVER
+# =====================================================
 
-@app.route('/api/sysmon/live', methods=['GET'])
-def sysmon_live():
-    template = random.choice(SYSMON_TEMPLATES)
-    now = datetime.now()
+@app.route('/api/detector/log', methods=['POST'])
+def detector_log():
+    data = request.get_json()
 
-    return jsonify({
-        **template,
-        "time": now.strftime("%H:%M:%S"),
-        "idCounter": random.random()
-    })
+    info = verify_detector_token(data.get("token"))
+    if not info:
+        return jsonify({"error": "Invalid token"}), 401
+
+    user_id = info["user_id"]
+    user_email = info["email"]
+
+    conn = pool.get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT INTO detector_logs (user_id, event_type, directory, event_count)
+        VALUES (%s, %s, %s, %s)
+    """, (
+        user_id,
+        data.get("event_type"),
+        data.get("details", {}).get("directory"),
+        data.get("details", {}).get("count")
+    ))
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    if data.get("event_type") == "mass_rename":
+        send_email_safe(
+            user_email,
+            "⚠ PRD-SYS ALERT: Mass File Rename Detected",
+            f"""
+Mass rename detected.
+
+Directory: {data.get("details", {}).get("directory")}
+Count: {data.get("details", {}).get("count")}
+
+Check your system immediately.
+"""
+        )
+
+    return jsonify({"status": "event stored"}), 200
+
+
+# =====================================================
+# DAILY SUMMARY SCHEDULER
+# =====================================================
+
+def send_daily_summary():
+    print("Running daily summary job...")
+
+    conn = pool.get_connection()
+    cursor = conn.cursor(dictionary=True)
+
+    cursor.execute("""
+        SELECT user_id, COUNT(*) as total_events
+        FROM detector_logs
+        WHERE DATE(created_at) = CURDATE() - INTERVAL 1 DAY
+        GROUP BY user_id
+    """)
+
+    users = cursor.fetchall()
+
+    for row in users:
+        cursor.execute("SELECT email FROM users WHERE id = %s", (row["user_id"],))
+        user = cursor.fetchone()
+
+        if user:
+            send_email_safe(
+                user["email"],
+                "📊 PRD-SYS Daily Security Summary",
+                f"""
+PRD-SYS Daily Summary Report
+
+Total suspicious events yesterday: {row["total_events"]}
+
+Login to dashboard for detailed insights.
+
+Stay secure.
+"""
+            )
+
+    cursor.close()
+    conn.close()
+
+
+scheduler = BackgroundScheduler()
+scheduler.add_job(send_daily_summary, 'cron', hour=9)
+scheduler.start()
+
+
+# =====================================================
+# RUN SERVER
+# =====================================================
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)

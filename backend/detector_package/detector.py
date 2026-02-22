@@ -2,87 +2,109 @@ import os
 import time
 import json
 import requests
+from datetime import datetime
 from collections import deque
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
+# ==============================
+# LOAD CONFIG
+# ==============================
+with open("config.json", "r") as f:
+    config = json.load(f)
+
+API_BASE = config["api_base"]
+TOKEN = config["token"]
+USER_EMAIL = config["email"]
+
+# ==============================
+# SETTINGS
+# ==============================
+RENAME_THRESHOLD = 15
+TIME_WINDOW = 10  # seconds
+
+rename_events = deque()
+
+# ==============================
+# LOCAL LOGGING
+# ==============================
 
 LOG_DIR = "logs"
 LOG_FILE = os.path.join(LOG_DIR, "monitor.log")
 
 if not os.path.exists(LOG_DIR):
     os.makedirs(LOG_DIR)
-    
-# ================= LOAD CONFIG =================
 
-with open("config.json", "r") as f:
-    config = json.load(f)
+def write_local_log(message):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    entry = f"[{timestamp}] {message}\n"
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(entry)
 
-API_BASE = config["api_base"]
-TOKEN = config["token"]
+# ==============================
+# BACKEND ALERT
+# ==============================
 
-RENAME_THRESHOLD = 15
-MODIFY_THRESHOLD = 25
-TIME_WINDOW = 10
-
-rename_events = deque()
-modify_events = deque()
-
-# ================= ALERT FUNCTION =================
-
-def send_alert(message):
-    print("⚠ ALERT:", message)
+def send_alert(event_type, details):
+    payload = {
+        "token": TOKEN,
+        "event_type": event_type,
+        "details": details,
+        "timestamp": datetime.now().isoformat()
+    }
 
     try:
         requests.post(
             f"{API_BASE}/api/detector/log",
-            json={
-                "token": TOKEN,
-                "log_content": message
-            },
+            json=payload,
             timeout=5
         )
-    except Exception as e:
-        print("Backend notify failed:", e)
+    except:
+        pass
 
-# ================= MONITOR CLASS =================
+# ==============================
+# MONITOR CLASS
+# ==============================
 
-class FolderGuard(FileSystemEventHandler):
+class FolderMonitor(FileSystemEventHandler):
 
     def on_moved(self, event):
         now = time.time()
         rename_events.append(now)
 
+        write_local_log(f"File renamed: {event.src_path}")
+
         while rename_events and now - rename_events[0] > TIME_WINDOW:
             rename_events.popleft()
 
         if len(rename_events) >= RENAME_THRESHOLD:
-            send_alert("Mass rename activity detected.")
+            message = "Mass file rename detected"
+            write_local_log(message)
+
+            send_alert(
+                event_type="mass_rename",
+                details={
+                    "directory": MONITOR_PATH,
+                    "count": len(rename_events)
+                }
+            )
+
             rename_events.clear()
 
-    def on_modified(self, event):
-        now = time.time()
-        modify_events.append(now)
+# ==============================
+# MAIN
+# ==============================
 
-        while modify_events and now - modify_events[0] > TIME_WINDOW:
-            modify_events.popleft()
-
-        if len(modify_events) >= MODIFY_THRESHOLD:
-            send_alert("High modification spike detected.")
-            modify_events.clear()
-
-# ================= MAIN =================
-
-def monitor_directory(path):
+def start_monitor(path):
     observer = Observer()
-    observer.schedule(FolderGuard(), path, recursive=True)
+    observer.schedule(FolderMonitor(), path, recursive=True)
     observer.start()
 
-    print("\n=================================")
-    print("PRD-SYS FolderGuard Running...")
+    print("===================================")
+    print("PRD-SYS FolderGuard Running")
     print("Monitoring:", path)
-    print("Press CTRL+C to stop.")
-    print("=================================\n")
+    print("Logs stored in:", LOG_FILE)
+    print("===================================")
 
     try:
         while True:
@@ -92,14 +114,11 @@ def monitor_directory(path):
 
     observer.join()
 
-
 if __name__ == "__main__":
+    user_input = input("Enter directory to monitor: ").strip()
 
-    print("Enter directory to monitor:")
-    target = input("> ").strip()
-
-    if not os.path.exists(target):
-        print("Invalid directory. Exiting.")
-        exit()
-
-    monitor_directory(target)
+    if not os.path.exists(user_input):
+        print("Invalid directory.")
+    else:
+        MONITOR_PATH = user_input
+        start_monitor(MONITOR_PATH)
