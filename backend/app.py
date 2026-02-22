@@ -162,6 +162,7 @@ def signup():
 
 
 @app.route('/api/login', methods=['POST'])
+@app.route('/api/login', methods=['POST'])
 def login():
     data = request.json
 
@@ -174,6 +175,10 @@ def login():
     )
 
     user = cursor.fetchone()
+
+    # 🔥 IMPORTANT FIX
+    cursor.fetchall()  # Clear unread results
+
     cursor.close()
     conn.close()
 
@@ -200,7 +205,6 @@ def login():
     )
 
     return jsonify({"pending": True, "identifier": email}), 200
-
 
 @app.route('/api/login/verify', methods=['POST'])
 def verify():
@@ -328,7 +332,7 @@ def send_daily_summary():
     print("Running daily summary job...")
 
     conn = pool.get_connection()
-    cursor = conn.cursor(dictionary=True)
+    cursor = conn.cursor(dictionary=True, buffered=True)
 
     cursor.execute("""
         SELECT user_id, COUNT(*) as total_events
